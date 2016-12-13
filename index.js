@@ -1,7 +1,6 @@
 const path = require('path');
 const loaderUtils = require('loader-utils');
-const jimp = require('jimp');
-const queue = require('d3-queue').queue;
+const sharp = require('sharp');
 
 const MIMES = {
   'jpg': 'image/jpeg',
@@ -43,94 +42,97 @@ module.exports = function loader(content) {
     const p = '__webpack_public_path__ + ' + JSON.stringify(f);
     return loaderCallback(null, 'module.exports = {srcSet:' + p + ',images:[{path:' + p + ',width:1}],src: ' + p + ',toString:function(){return ' + p + '}};');
   }
+  const img = sharp(loaderContext.resourcePath);
 
-  return jimp.read(loaderContext.resourcePath, (err, img) => {
-    if (err) {
-      return loaderCallback(err);
-    }
+  return img
+    .metadata()
+    .then(metadata => {
+      const promises = [];
+      const widthsToGenerate = new Set();
 
-    function resizeImage(width, queueCallback) {
-      img
-          .clone()
-          .resize(width, jimp.AUTO)
-          .quality(quality)
-          .background(background)
-          .getBuffer(mime, function resizeCallback(queueErr, buf) {
-            if (err) {
-              return queueCallback(queueErr);
+      (Array.isArray(sizes) ? sizes : [sizes])
+        .map(size => parseInt(size, 10))
+        .forEach(size => {
+          const width = Math.min(metadata.width, size);
+
+          // Only resize images if they aren't an exact copy of one already being resized...
+          if (!widthsToGenerate.has(width)) {
+            widthsToGenerate.add(width);
+
+            promises.push(
+              img
+              .clone()
+              .resize(width, null)
+              .jpeg({quality: quality})
+              .background(background)
+              .toBuffer()
+              .then((buf) => {
+                const fileName = loaderUtils.interpolateName(loaderContext, name + ext, {
+                  context: outputContext,
+                  content: buf
+                }).replace(/\[width\]/ig, width);
+                let factor;
+                if (width < metadata.width) {
+                  factor = metadata.width / width;
+                } else if (width > metadata.width) {
+                  factor = width / metadata.width;
+                }
+                const height = metadata.height / factor;
+
+                loaderContext.emitFile(fileName, buf);
+
+                return {
+                  src: '__webpack_public_path__ + ' + JSON.stringify(fileName + ' ' + width + 'w'),
+                  path: '__webpack_public_path__ + ' + JSON.stringify(fileName),
+                  width: width,
+                  height: height
+                };
+              }));
+          }
+        });
+
+        if (outputPlaceholder) {
+          promises.push(
+            img
+              .clone()
+              .resize(placeholderSize, null)
+              .quality(quality)
+              .background(background)
+              .toBuffer()
+              .then(buf => {
+                const placeholder = buf.toString('base64');
+                return JSON.stringify('data:' + (mime ? mime + ';' : '') + 'base64,' + placeholder);
+              })
+          );
+        }
+
+        return Promise
+          .all(promises)
+          .then(files => {
+            'use strict'; // eslint-disable-line
+            let placeholder;
+            if (outputPlaceholder) {
+              placeholder = files.pop();
             }
 
-            const fileName = loaderUtils.interpolateName(loaderContext, name + ext, {
-              context: outputContext,
-              content: buf
-            }).replace(/\[width\]/ig, width);
+            const srcset = files.map(f => f.src).join('+","+');
 
-            loaderContext.emitFile(fileName, buf);
+            const images = files.map(f => '{path:' + f.path + ',width:' + f.width + ',height:' + f.height + '}').join(',');
 
-            return queueCallback(null, {
-              src: '__webpack_public_path__ + ' + JSON.stringify(fileName + ' ' + width + 'w'),
-              path: '__webpack_public_path__ + ' + JSON.stringify(fileName),
-              width: width,
-              height: this.bitmap.height
-            });
+            const firstImage = files[0];
+
+            loaderCallback(null, 'module.exports = {' +
+                'srcSet:' + srcset + ',' +
+                'images:[' + images + '],' +
+                'src:' + firstImage.path + ',' +
+                'toString:function(){return ' + firstImage.path + '},' +
+                'placeholder: ' + placeholder + ',' +
+                'width:' + firstImage.width + ',' +
+                'height:' + firstImage.height +
+            '};');
           });
-    }
-
-    const q = queue();
-    const widthsToGenerate = new Set();
-
-    (Array.isArray(sizes) ? sizes : [sizes]).forEach((size) => {
-      const width = Math.min(img.bitmap.width, parseInt(size, 10));
-
-      // Only resize images if they aren't an exact copy of one already being resized...
-      if (!widthsToGenerate.has(width)) {
-        widthsToGenerate.add(width);
-        q.defer(resizeImage, width);
-      }
-    });
-
-    if (outputPlaceholder) {
-      q.defer(function generatePlaceholder(queueCallback) {
-        img
-            .clone()
-            .resize(placeholderSize, jimp.AUTO)
-            .quality(quality)
-            .background(background)
-            .getBuffer(mime, function resizeCallback(queueErr, buf) {
-              if (err) {
-                return queueCallback(queueErr);
-              }
-
-              const placeholder = buf.toString('base64');
-              return queueCallback(null, JSON.stringify('data:' + (mime ? mime + ';' : '') + 'base64,' + placeholder));
-            });
-      });
-    }
-
-    return q.awaitAll((queueErr, files) => {
-      'use strict'; // eslint-disable-line
-      let placeholder;
-      if (outputPlaceholder) {
-        placeholder = files.pop();
-      }
-
-      const srcset = files.map(f => f.src).join('+","+');
-
-      const images = files.map(f => '{path:' + f.path + ',width:' + f.width + ',height:' + f.height + '}').join(',');
-
-      const firstImage = files[0];
-
-      loaderCallback(null, 'module.exports = {' +
-          'srcSet:' + srcset + ',' +
-          'images:[' + images + '],' +
-          'src:' + firstImage.path + ',' +
-          'toString:function(){return ' + firstImage.path + '},' +
-          'placeholder: ' + placeholder + ',' +
-          'width:' + firstImage.width + ',' +
-          'height:' + firstImage.height +
-      '};');
-    });
-  });
+    })
+    .catch(err => loaderCallback(err));
 };
 
 module.exports.raw = true; // get buffer stream instead of utf8 string
